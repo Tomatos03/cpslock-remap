@@ -1,8 +1,10 @@
-use std::{collections::HashSet, sync::mpsc::{Receiver, Sender}, time::{Duration, Instant}};
+use std::{collections::HashSet, env, sync::mpsc::{Receiver, Sender}, time::{Duration, Instant}};
 use interception::{Interception, Stroke, KeyState, ScanCode, Filter, KeyFilter, is_keyboard};
 use log::{info, debug, error};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-use crate::tray::TrayState;
+use crate::tray::{Message, TrayState, ThresholdEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -15,12 +17,12 @@ enum State {
 
 const NO_DEVICE: i32 = 0;
 const NO_EVENT: i32 = 0;
-const THRESHOLD: Duration = Duration::from_millis(200);
 const READ_TIMEOUT: Duration = Duration::from_millis(1);
 
-pub fn intercept_keyboard_thread(sender :Sender<TrayState>,  receiver :Receiver<TrayState>) {
+pub fn intercept_keyboard_thread(sender :Sender<Message>,  receiver :Receiver<Message>) {
     info!("键盘拦截线程启动");
     debug!("尝试创建 interception context");
+    let mut threshold = load_config_json();
     let ctx = match Interception::new() {
         Some(ctx) => {
             info!("Interception context 创建成功");
@@ -47,17 +49,10 @@ pub fn intercept_keyboard_thread(sender :Sender<TrayState>,  receiver :Receiver<
     info!("键盘拦截循环开始运行");
 
     loop {
-        if let Ok(new_tray_state) = receiver.try_recv() {
-            info!("收到托盘状态变更: {:?} -> {:?}", tray_state, new_tray_state);
-            tray_state = new_tray_state;
-        }
-
-        match tray_state {
-            TrayState::Exiting => {
-                info!("收到退出信号，准备结束键盘拦截线程");
-                break;
-            },
-            _ => {}
+        try_rev_and_handler_message(&sender, &receiver, &mut tray_state, &mut threshold);
+        if tray_state == TrayState::Exiting {
+            info!("收到退出信号，准备结束键盘拦截线程");
+            break;
         }
 
         let device = ctx.wait_with_timeout(READ_TIMEOUT);
@@ -82,19 +77,15 @@ pub fn intercept_keyboard_thread(sender :Sender<TrayState>,  receiver :Receiver<
             }
         };
 
-        if tray_state == TrayState::Pause {
-            debug!("程序处于暂停状态，直接转发按键");
-            ctx.send(device, &buf);
-            continue;
-        }
-
-        if code != ScanCode::CapsLock {
+        if tray_state == TrayState::Pause || code != ScanCode::CapsLock {
+            if tray_state == TrayState::Pause {
+                debug!("程序处于暂停状态，直接转发按键");
+            }
             ctx.send(device, &buf);
             continue;
         }
 
         debug!("检测到 CapsLock 按键，当前状态: {:?}", state);
-
         match (key_state, state) {
             (KeyState::DOWN, State::Idle) => {
                 debug!("CapsLock 按下，从 Idle 切换到 Pressed");
@@ -116,8 +107,8 @@ pub fn intercept_keyboard_thread(sender :Sender<TrayState>,  receiver :Receiver<
 
                 if let State::Pressed { since } = state {
                     let elapsed = since.elapsed();
-                    debug!("按键持续时间: {:?}ms", elapsed.as_millis());
-                    if elapsed <= THRESHOLD {
+                    debug!("按键持续时间: {:?}ms, 当前时间阈值: {:?}", elapsed.as_millis(), threshold.as_millis());
+                    if elapsed <= threshold {
                         debug!("短按检测，发送 ESC 按键");
                         ctx.send(device, &[esc(KeyState::DOWN)]);
                         ctx.send(device, &[esc(KeyState::UP)]);
@@ -145,8 +136,9 @@ pub fn intercept_keyboard_thread(sender :Sender<TrayState>,  receiver :Receiver<
     clear_holding_caplock(last_cps_down_dev_set, ctx);
     tray_state = TrayState::Exited;
     info!("发送退出完成信号");
-    sender.send(TrayState::Exited).expect("发送退出信号失败");
+    sender.send(Message::TrayState(TrayState::Exited)).expect("发送退出信号失败");
     info!("键盘拦截线程结束，最终状态: {:?}", tray_state);
+    store_config_json(threshold);
 }
 
 fn clear_holding_caplock(mut set :HashSet<i32>, ctx :Interception) {
@@ -164,4 +156,70 @@ fn esc(st: KeyState) -> Stroke {
 
 fn lctrl(st: KeyState) -> Stroke {
     Stroke::Keyboard { code: ScanCode::LeftControl, state: st, information: 0 }
+}
+
+fn try_rev_and_handler_message(sender: &Sender<Message>, receiver :&Receiver<Message>, tray_state: &mut TrayState, current_threshold: &mut Duration) {
+    if let Ok(message) = receiver.try_recv() {
+        match message {
+            Message::TrayState(new_tray_state) => handle_tray_state(tray_state, new_tray_state),
+            Message::ThresholdEvent(event) => handle_threshold_event(sender, current_threshold, event),
+        }
+    }
+}
+
+fn handle_tray_state(tray_state: &mut TrayState, new_tray_state: TrayState) {
+    info!("收到托盘状态变更: {:?} -> {:?}", tray_state, new_tray_state);
+    *tray_state = new_tray_state;
+}
+
+fn handle_threshold_event(sender: &Sender<Message>, threshold: &mut Duration, event: ThresholdEvent) {
+    match event {
+        ThresholdEvent::Get => {
+            sender.send(Message::ThresholdEvent(ThresholdEvent::CurrentValue(*threshold)))
+                .expect("发送阈值失败");
+        }
+        ThresholdEvent::Set(new_threshold) => {
+            *threshold = new_threshold;
+        }
+        _ => {}
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct Config {
+    threshold: u64,
+}
+
+fn load_config_json() -> Duration {
+    // 获取用户目录
+    let user_dir = env::var("USERPROFILE").expect("无法获取用户目录");
+    let mut config_path = PathBuf::from(user_dir);
+    config_path.push(".caps-remap.json");
+
+    let json_str = match std::fs::read_to_string(&config_path) {
+        Ok(t) => t,
+        Err(_) => return Duration::from_millis(200),
+    };
+
+
+    // 能解析就取阈值，解析失败也返回默认值
+    Duration::from_millis(
+        serde_json::from_str::<Config>(&json_str)
+            .map(|c| c.threshold)
+            .unwrap_or(200) as u64
+    )
+}
+
+fn store_config_json(threshold: Duration) {
+    // 获取用户目录
+    let user_dir = env::var("USERPROFILE").expect("无法获取用户目录");
+    let mut config_path = PathBuf::from(user_dir);
+    config_path.push(".caps-remap.json");
+
+    let config = Config {
+        threshold: threshold.as_millis() as u64,
+    };
+
+    let json = serde_json::to_string_pretty(&config).expect("序列化配置失败");
+    std::fs::write(config_path, json).expect("写入配置文件失败");
 }
